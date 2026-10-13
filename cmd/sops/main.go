@@ -2,6 +2,8 @@ package main // import "github.com/getsops/sops/v3/cmd/sops"
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	encodingjson "encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/getsops/sops/v3"
@@ -86,8 +89,23 @@ func main() {
 		},
 		cli.StringSliceFlag{
 			Name:   "keyservice",
-			Usage:  "Specify the key services to use in addition to the local one. Can be specified more than once. Syntax: protocol://address. Example: tcp://myserver.com:5000",
+			Usage:  "Specify the key services to use in addition to the local one. Can be specified more than once. Syntax: protocol://address. Example: tcp://myserver.com:5000, or tls://myserver.com:5000 to connect over TLS",
 			EnvVar: "SOPS_KEYSERVICE",
+		},
+		cli.StringFlag{
+			Name:   "keyservice-ca-file",
+			Usage:  "PEM file of CA certificates to verify tls:// key services with, instead of the system roots",
+			EnvVar: "SOPS_KEYSERVICE_CA_FILE",
+		},
+		cli.StringFlag{
+			Name:   "keyservice-cert-file",
+			Usage:  "PEM file of the client certificate to present to tls:// key services",
+			EnvVar: "SOPS_KEYSERVICE_CERT_FILE",
+		},
+		cli.StringFlag{
+			Name:   "keyservice-key-file",
+			Usage:  "PEM file of the private key for --keyservice-cert-file",
+			EnvVar: "SOPS_KEYSERVICE_KEY_FILE",
 		},
 	}
 	app.Name = "sops"
@@ -2333,8 +2351,33 @@ func keyservices(c *cli.Context) (svcs []keyservice.KeyServiceClient) {
 		}
 		addr := url.Host
 		addrToUse := addr
+		network := url.Scheme
 		opts := []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		}
+		if url.Scheme == "tls" {
+			network = "tcp"
+			tlsConfig := &tls.Config{}
+			if caFile := c.String("keyservice-ca-file"); caFile != "" {
+				pem, err := os.ReadFile(caFile)
+				if err != nil {
+					log.Fatalf("failed to read keyservice CA %v", err)
+				}
+				tlsConfig.RootCAs = x509.NewCertPool()
+				if !tlsConfig.RootCAs.AppendCertsFromPEM(pem) {
+					log.Fatalf("no certificates found in keyservice CA %s", caFile)
+				}
+			}
+			if certFile, keyFile := c.String("keyservice-cert-file"), c.String("keyservice-key-file"); certFile != "" || keyFile != "" {
+				pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+				if err != nil {
+					log.Fatalf("failed to load keyservice client certificate: %v", err)
+				}
+				tlsConfig.Certificates = []tls.Certificate{pair}
+			}
+			opts = []grpc.DialOption{
+				grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+			}
 		}
 		if url.Scheme == "unix" {
 			addr = url.Path
@@ -2343,7 +2386,7 @@ func keyservices(c *cli.Context) (svcs []keyservice.KeyServiceClient) {
 			opts = append(opts,
 				grpc.WithContextDialer(
 					func(ctx context.Context, addr string) (net.Conn, error) {
-						return (&net.Dialer{}).DialContext(ctx, url.Scheme, addr)
+						return (&net.Dialer{}).DialContext(ctx, network, addr)
 					},
 				))
 		}
